@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, make_response
 from models import Employee, Incident, IncidentStatus
 from schemas.incident_schema import EmployeeSchema
 from extensions import db
@@ -9,6 +9,7 @@ from werkzeug.security import generate_password_hash
 employees_bp = Blueprint('employees', __name__)
 employee_schema = EmployeeSchema()
 employee_list_schema = EmployeeSchema(many=True)
+
 
 # 🔒 Проверка роли администратора
 def admin_required(fn):
@@ -22,6 +23,7 @@ def admin_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+
 # 🔍 Все сотрудники с назначением
 @employees_bp.route('/', methods=['GET'])
 @admin_required
@@ -30,7 +32,6 @@ def get_all_employees():
     result = []
 
     for e in employees:
-        # Есть ли незавершённый инцидент
         assigned_incident = (
             db.session.query(Incident)
             .join(IncidentStatus)
@@ -54,16 +55,42 @@ def get_all_employees():
 
     return jsonify(result), 200
 
+
 # 🔍 Один сотрудник
-@employees_bp.route('/<int:employee_id>', methods=['GET'])
+@employees_bp.route('', methods=['GET'])
 @jwt_required()
-def get_employee(employee_id):
-    user_id = get_jwt_identity()
-    user = Employee.query.get(user_id)
-    if user.role != 'admin' and user.id != employee_id:
-        return jsonify({"error": "Доступ запрещён"}), 403
-    employee = Employee.query.get_or_404(employee_id)
-    return employee_schema.dump(employee), 200
+def get_employees():
+    employees = Employee.query.all()
+    result = []
+
+    for emp in employees:
+        active_incident = (
+            db.session.query(Incident)
+            .filter(Incident.assigned_employee_id == emp.id)
+            .join(IncidentStatus)
+            .filter(IncidentStatus.name != 'завершён')
+            .first()
+        )
+
+        emp_data = {
+            'id': emp.id,
+            'name': f"{emp.first_name} {emp.last_name}",
+            'email': emp.email,
+            'role': emp.role,
+            'assigned_incident': None
+        }
+
+        if active_incident:
+            emp_data['assigned_incident'] = {
+                'id': active_incident.id,
+                'title': active_incident.title,
+                'status': active_incident.status.name
+            }
+
+        result.append(emp_data)
+
+    return jsonify(result), 200
+
 
 # ➕ Создание сотрудника
 @employees_bp.route('/', methods=['POST'])
@@ -86,6 +113,7 @@ def create_employee():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+
 # ✏️ Обновление
 @employees_bp.route('/<int:employee_id>', methods=['PUT'])
 @admin_required
@@ -101,11 +129,14 @@ def update_employee(employee_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+
+# ❌ Удаление
 @employees_bp.route('/<int:employee_id>', methods=['DELETE'])
 @admin_required
 def delete_employee(employee_id):
     employee = Employee.query.get_or_404(employee_id)
 
+    # получаем все незавершённые инциденты, назначенные на этого сотрудника
     open_incidents = (
         db.session.query(Incident)
         .join(IncidentStatus)
@@ -114,12 +145,16 @@ def delete_employee(employee_id):
         .all()
     )
 
+    # если нет активных инцидентов — просто удаляем
     if not open_incidents:
         db.session.delete(employee)
         db.session.commit()
         return jsonify({"message": "Сотрудник удалён"}), 200
 
-    # Переназначаем
+    # получаем reassigned_to из тела запроса
+    data = request.get_json(silent=True) or {}
+    reassigned_to = data.get('reassigned_to')
+
     free_employees = Employee.query.filter(
         Employee.id != employee_id,
         Employee.role == 'user'
@@ -129,10 +164,18 @@ def delete_employee(employee_id):
     admin = Employee.query.get(admin_id)
 
     for incident in open_incidents:
-        if free_employees:
+        reassignee = None
+
+        if reassigned_to:
+            reassignee = Employee.query.get(reassigned_to)
+            if not reassignee:
+                return jsonify({"error": "Неверный reassigned_to ID"}), 400
+        elif free_employees:
             reassignee = free_employees.pop(0)
         else:
             reassignee = admin
+
+        # вот здесь происходит переназначение!
         incident.assigned_employee_id = reassignee.id
         db.session.add(incident)
 
@@ -141,8 +184,14 @@ def delete_employee(employee_id):
 
     return jsonify({"message": "Сотрудник удалён, инциденты переназначены"}), 200
 
-@employees_bp.route('/busy', methods=['GET'])
-@admin_required
-def get_busy():
-    busy = Employee.query.filter_by(is_busy=True).all()
-    return jsonify([f"{e.first_name} {e.last_name}" for e in busy])
+
+# 🔄 Preflight CORS support
+@employees_bp.route('/', methods=['OPTIONS'])
+@employees_bp.route('/<int:employee_id>', methods=['OPTIONS'])
+def preflight_employees(employee_id=None):
+    resp = make_response()
+    resp.headers['Access-Control-Allow-Origin'] = 'http://localhost:3000'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    resp.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
+    resp.headers['Access-Control-Allow-Credentials'] = 'true'
+    return resp, 200
